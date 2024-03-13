@@ -1,0 +1,212 @@
+pragma solidity ^0.5.0;
+
+contract P2PLending {
+    struct Collateral {
+        string assetType;
+        string assetID;
+        uint value;
+    }
+
+    Collateral public collateral;
+    address public owner;
+    uint public loanAmount;
+    uint public interestRate;
+    uint public termLength;
+    address public borrower;
+    address payable public lender;
+    bool public loanActive;
+    uint public unpaidBalance;
+    uint public paidOffTimestamp;
+    mapping (address => bool) public borrowerApproval;
+    mapping (address => bool) public lenderApproval;
+    address public oldContractAddress;
+    address public weChargAddress;
+    address public landOwnerAddress;
+    address public chargingStationOwnerAddress;
+    uint public weChargProfitPercentBeforeEpoch; // Profit percent for WeCharg before epoch
+    uint public landOwnerProfitPercentBeforeEpoch; // Profit percent for land owner before epoch
+    uint public chargingStationOwnerProfitPercentBeforeEpoch; // Profit percent for charging station owner before epoch
+    uint public weChargProfitPercentAfterEpoch; // Profit percent for WeCharg after epoch
+    uint public landOwnerProfitPercentAfterEpoch; // Profit percent for land owner after epoch
+    uint public chargingStationOwnerProfitPercentAfterEpoch; // Profit percent for charging station owner after epoch
+    uint public numMLMTiers; // Number of MLM tiers
+    mapping (uint => address) public mlmTiers; // Mapping of MLM tier index to address
+    mapping (address => uint) public mlmTierProfitPercent; // Profit percent for each MLM tier
+
+    uint256 public chargingStationIncome;
+    uint256 public lastProfitDistributionAmount;
+    uint256 public profitDistributionEpoch;
+
+    modifier onlyAgent() {
+        require(msg.sender == weChargAddress || msg.sender == chargingStationOwnerAddress, "Only agent can call this function");
+        _;
+    }
+
+    constructor(
+        uint _loanAmount,
+        uint _interestRate,
+        uint _termLength,
+        address _oldContractAddress,
+        address _weChargAddress,
+        address _landOwnerAddress,
+        address _chargingStationOwnerAddress
+    ) public {
+        owner = msg.sender;
+        loanAmount = _loanAmount;
+        interestRate = _interestRate;
+        termLength = _termLength;
+        unpaidBalance = loanAmount;
+        oldContractAddress = _oldContractAddress;
+        weChargAddress = _weChargAddress;
+        landOwnerAddress = _landOwnerAddress;
+        chargingStationOwnerAddress = _chargingStationOwnerAddress;
+        weChargProfitPercentBeforeEpoch = 20;
+        landOwnerProfitPercentBeforeEpoch = 0; // Set to 0 initially, adjustable by WeCharg
+        chargingStationOwnerProfitPercentBeforeEpoch = 80;
+        weChargProfitPercentAfterEpoch = 17; // Adjustable by WeCharg
+        landOwnerProfitPercentAfterEpoch = 0; // Adjustable by WeCharg
+        chargingStationOwnerProfitPercentAfterEpoch = 77; // Adjustable by WeCharg
+        numMLMTiers = 0;
+    }
+
+    function requestLoan(address _borrower) public {
+        require(borrowerApproval[_borrower] == false);
+        borrowerApproval[_borrower] = true;
+    }
+
+    function addCollateral(string memory _assetType, string memory _assetID, uint _value) public {
+        require(_value >= loanAmount, "Collateral value must be greater than or equal to loan amount.");
+        collateral.assetType = _assetType;
+        collateral.assetID = _assetID;
+        collateral.value = _value;
+    }
+
+    function approveLoan(address _borrower) public {
+        require(lenderApproval[msg.sender] == false);
+        require(borrowerApproval[_borrower] == true);
+        lenderApproval[msg.sender] = true;
+        borrower = _borrower;
+        lender = msg.sender;
+        loanActive = true;
+        unpaidBalance = loanAmount;
+        paidOffTimestamp = now + (termLength * 1 weeks);
+    }
+
+    function payOffLoan() public payable {
+        require(loanActive == true);
+        require(msg.sender == borrower);
+        require(msg.value == unpaidBalance);
+        loanActive = false;
+        unpaidBalance = 0;
+        // Calculate and transfer profits to respective addresses
+        distributeProfit();
+        // Transfer remaining balance to the lender
+        lender.transfer(msg.value);
+    }
+
+    function changeLender(address payable _newLender) public {
+        require(loanActive == true);
+        require(msg.sender == lender);
+        lender = _newLender;
+    }
+
+    function calculatePaymentAmount() public view returns (uint) {
+        uint interest = (loanAmount * interestRate) / 100;
+        uint paymentAmount = loanAmount + interest;
+        return paymentAmount;
+    }
+
+    function transferMultisigOwnership(address _newOwner) public {
+        require(msg.sender == owner);
+        owner = _newOwner;
+    }
+
+    function setProfitDistribution(
+        uint _weChargProfitPercentBeforeEpoch,
+        uint _landOwnerProfitPercentBeforeEpoch,
+        uint _chargingStationOwnerProfitPercentBeforeEpoch,
+        uint _weChargProfitPercentAfterEpoch,
+        uint _landOwnerProfitPercentAfterEpoch,
+        uint _chargingStationOwnerProfitPercentAfterEpoch
+    ) public {
+        require(msg.sender == owner);
+        weChargProfitPercentBeforeEpoch = _weChargProfitPercentBeforeEpoch;
+        landOwnerProfitPercentBeforeEpoch = _landOwnerProfitPercentBeforeEpoch;
+        chargingStationOwnerProfitPercentBeforeEpoch = _chargingStationOwnerProfitPercentBeforeEpoch;
+        weChargProfitPercentAfterEpoch = _weChargProfitPercentAfterEpoch;
+        landOwnerProfitPercentAfterEpoch = _landOwnerProfitPercentAfterEpoch;
+        chargingStationOwnerProfitPercentAfterEpoch = _chargingStationOwnerProfitPercentAfterEpoch;
+    }
+
+    function addMLMTier(address _tierAddress, uint _profitPercent) public {
+        require(msg.sender == owner);
+        require(numMLMTiers < 3); // Maximum 3 MLM tiers allowed
+        numMLMTiers++;
+        mlmTiers[numMLMTiers] = _tierAddress;
+        mlmTierProfitPercent[_tierAddress] = _profitPercent;
+    }
+
+    function removeMLMTier(address _tierAddress) public {
+        require(msg.sender == owner);
+        require(mlmTierProfitPercent[_tierAddress] > 0); // Tier address must exist
+        delete mlmTiers[numMLMTiers];
+        delete mlmTierProfitPercent[_tierAddress];
+        numMLMTiers--;
+    }
+
+    function collectRevenueFromChargingStation(uint256 _revenue) public onlyAgent {
+        chargingStationIncome += _revenue;
+    }
+
+    function distributeProfit() internal {
+        require(now >= paidOffTimestamp);
+
+        uint256 currentEpoch = now;
+        uint256 totalProfit = chargingStationIncome + lastProfitDistributionAmount;
+
+        // Calculate profit distribution percentages based on the current epoch
+        uint256 weChargProfitPercent;
+        uint256 landOwnerProfitPercent;
+        uint256 chargingStationOwnerProfitPercent;
+
+        if (currentEpoch < paidOffTimestamp) {
+            weChargProfitPercent = weChargProfitPercentBeforeEpoch;
+            landOwnerProfitPercent = landOwnerProfitPercentBeforeEpoch;
+            chargingStationOwnerProfitPercent = chargingStationOwnerProfitPercentBeforeEpoch;
+        } else {
+            weChargProfitPercent = weChargProfitPercentAfterEpoch;
+            landOwnerProfitPercent = landOwnerProfitPercentAfterEpoch;
+            chargingStationOwnerProfitPercent = chargingStationOwnerProfitPercentAfterEpoch;
+        }
+
+        // Calculate profit distribution amounts
+        uint256 weChargProfitAmount = (totalProfit * weChargProfitPercent) / 100;
+        uint256 landOwnerProfitAmount = (totalProfit * landOwnerProfitPercent) / 100;
+        uint256 chargingStationOwnerProfitAmount = (totalProfit * chargingStationOwnerProfitPercent) / 100;
+        uint256 mlmProfitAmount = totalProfit - weChargProfitAmount - landOwnerProfitAmount - chargingStationOwnerProfitAmount;
+
+        // Transfer profits to respective addresses
+        payable(weChargAddress).transfer(weChargProfitAmount);
+        payable(landOwnerAddress).transfer(landOwnerProfitAmount);
+        payable(chargingStationOwnerAddress).transfer(chargingStationOwnerProfitAmount);
+
+        // Distribute MLM profits
+        distributeMLMProfit(mlmProfitAmount);
+
+        // Reset charging station income and profit distribution epoch
+        chargingStationIncome = 0;
+        lastProfitDistributionAmount = totalProfit;
+        profitDistributionEpoch = currentEpoch;
+    }
+
+    function distributeMLMProfit(uint256 _mlmProfitAmount) internal {
+        uint256 mlmTierProfit = _mlmProfitAmount / numMLMTiers;
+
+        for (uint256 i = 1; i <= numMLMTiers; i++) {
+            address tierAddress = mlmTiers[i];
+            uint256 tierProfitPercent = mlmTierProfitPercent[tierAddress];
+            uint256 tierProfitAmount = (mlmTierProfit * tierProfitPercent) / 100;
+            payable(tierAddress).transfer(tierProfitAmount);
+        }
+    }
+}

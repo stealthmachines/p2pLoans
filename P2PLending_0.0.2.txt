@@ -1,0 +1,220 @@
+pragma solidity ^0.8.0;
+
+contract P2PLending {
+    struct Collateral {
+        string assetType;
+        string assetID;
+        uint256 value;
+    }
+
+    struct Transaction {
+        uint256 amount;
+        uint256 timestamp;
+    }
+
+    Collateral public collateral;
+    address public owner;
+    uint256 public loanAmount;
+    uint256 public interestRate;
+    uint256 public termLength;
+    address public borrower;
+    address payable public lender;
+    bool public loanActive;
+    uint256 public unpaidBalance;
+    mapping(address => bool) public borrowerApproval;
+    mapping(address => bool) public lenderApproval;
+    address public weChargAddress;
+    address public chargingStationOwnerAddress;
+    uint256 public weChargProfitPercentBeforeEpoch; // Profit percent for WeCharg before epoch
+    uint256 public chargingStationOwnerProfitPercentBeforeEpoch; // Profit percent for charging station owner before epoch
+    uint256 public weChargProfitPercentAfterEpoch; // Profit percent for WeCharg after epoch
+    uint256 public chargingStationOwnerProfitPercentAfterEpoch; // Profit percent for charging station owner after epoch
+    uint256 public numMLMTiers; // Number of MLM tiers
+    mapping(uint256 => address) public mlmTiers; // Mapping of MLM tier index to address
+    mapping(address => uint256) public mlmTierProfitPercent; // Profit percent for each MLM tier
+
+    mapping(address => Transaction[]) public oldContractProceeds; // Proceeds from the old contract per CHG address
+
+    modifier onlyAgent() {
+        require(
+            msg.sender == chargingStationOwnerAddress,
+            "Only the charging station owner can call this function"
+        );
+        _;
+    }
+
+    event ProceedsProcessed(address indexed chgAddress, uint256 amount, uint256 timestamp);
+    event LoanRequested(address indexed borrower);
+    event CollateralAdded(string assetType, string assetID, uint256 value);
+    event LoanApproved(address indexed lender, address indexed borrower);
+    event LoanPaidOff(address indexed borrower, address indexed lender, uint256 amount);
+    event LenderChanged(address indexed previousLender, address indexed newLender);
+    event MLMTierAdded(address indexed tierAddress, uint256 profitPercent);
+    event MLMTierRemoved(address indexed tierAddress);
+    event MLMProfitCollected(address indexed tierAddress, uint256 amount);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(
+        uint256 _loanAmount,
+        uint256 _interestRate,
+        uint256 _termLength,
+        address _weChargAddress,
+        address _chargingStationOwnerAddress
+    ) {
+        owner = msg.sender;
+        loanAmount = _loanAmount;
+        interestRate = _interestRate;
+        termLength = _termLength;
+        unpaidBalance = loanAmount;
+        weChargAddress = _weChargAddress;
+        chargingStationOwnerAddress = _chargingStationOwnerAddress;
+        weChargProfitPercentBeforeEpoch = 20;
+        chargingStationOwnerProfitPercentBeforeEpoch = 80;
+        weChargProfitPercentAfterEpoch = 17; // Adjustable by WeCharg
+        chargingStationOwnerProfitPercentAfterEpoch = 77; // Adjustable by WeCharg
+        numMLMTiers = 0;
+    }
+
+    function requestLoan(address _borrower) public {
+        require(borrowerApproval[_borrower] == false, "Loan already requested by the borrower");
+        borrowerApproval[_borrower] = true;
+        emit LoanRequested(_borrower);
+    }
+
+    function addCollateral(string memory _assetType, string memory _assetID, uint256 _value) public {
+        require(_value >= loanAmount, "Collateral value must be greater than or equal to the loan amount");
+        collateral.assetType = _assetType;
+        collateral.assetID = _assetID;
+        collateral.value = _value;
+        emit CollateralAdded(_assetType, _assetID, _value);
+    }
+
+    function approveLoan(address _borrower) public {
+        require(lenderApproval[msg.sender] == false, "Loan already approved by the lender");
+        require(borrowerApproval[_borrower] == true, "Loan not requested or not approved by the borrower");
+        lenderApproval[msg.sender] = true;
+        borrower = _borrower;
+        lender = payable(msg.sender);
+        loanActive = true;
+        unpaidBalance = loanAmount;
+        emit LoanApproved(msg.sender, _borrower);
+    }
+
+    function payOffLoan() public payable {
+        require(loanActive == true, "No active loan");
+        require(msg.sender == borrower, "Only the borrower can pay off the loan");
+        require(msg.value == unpaidBalance, "Incorrect loan amount");
+
+        // Calculate profit amounts
+        uint256 weChargProfitAmount = (msg.value * weChargProfitPercentBeforeEpoch) / 100;
+        uint256 chargingStationOwnerProfitAmount =
+            (msg.value * chargingStationOwnerProfitPercentBeforeEpoch) / 100;
+        uint256 mlmProfitAmount = msg.value - weChargProfitAmount - chargingStationOwnerProfitAmount;
+
+        // Transfer profits to respective addresses
+        require(
+            address(this).balance >= weChargProfitAmount + chargingStationOwnerProfitAmount,
+            "Insufficient contract balance"
+        );
+        payable(weChargAddress).transfer(weChargProfitAmount);
+        payable(chargingStationOwnerAddress).transfer(chargingStationOwnerProfitAmount);
+
+        // Distribute MLM profits
+        distributeMLMProfit(mlmProfitAmount);
+
+        // Transfer remaining balance to the lender
+        uint256 remainingBalance = msg.value - (weChargProfitAmount + chargingStationOwnerProfitAmount);
+        require(remainingBalance > 0, "No remaining balance to transfer");
+        lender.transfer(remainingBalance);
+
+        // Mark loan as paid off
+        loanActive = false;
+        unpaidBalance = 0;
+        emit LoanPaidOff(borrower, lender, msg.value);
+    }
+
+    function changeLender(address payable _newLender) public {
+        require(loanActive == true, "No active loan");
+        require(msg.sender == lender, "Only the current lender can change the lender");
+        lender = _newLender;
+        emit LenderChanged(msg.sender, _newLender);
+    }
+
+    function calculatePaymentAmount() public view returns (uint256) {
+        uint256 interest = (loanAmount * interestRate) / 100;
+        uint256 paymentAmount = loanAmount + interest;
+        return paymentAmount;
+    }
+
+    function setProfitDistribution(
+        uint256 _weChargProfitPercentBeforeEpoch,
+        uint256 _chargingStationOwnerProfitPercentBeforeEpoch,
+        uint256 _weChargProfitPercentAfterEpoch,
+        uint256 _chargingStationOwnerProfitPercentAfterEpoch
+    ) public {
+        require(msg.sender == owner, "Only the contract owner can set profit distribution");
+        weChargProfitPercentBeforeEpoch = _weChargProfitPercentBeforeEpoch;
+        chargingStationOwnerProfitPercentBeforeEpoch = _chargingStationOwnerProfitPercentBeforeEpoch;
+        weChargProfitPercentAfterEpoch = _weChargProfitPercentAfterEpoch;
+        chargingStationOwnerProfitPercentAfterEpoch = _chargingStationOwnerProfitPercentAfterEpoch;
+    }
+
+    function addMLMTier(address _tierAddress, uint256 _profitPercent) public {
+        require(msg.sender == owner, "Only the contract owner can add an MLM tier");
+        require(numMLMTiers < 3, "Maximum number of MLM tiers reached"); // Maximum 3 MLM tiers allowed
+        numMLMTiers++;
+        mlmTiers[numMLMTiers] = _tierAddress;
+        mlmTierProfitPercent[_tierAddress] = _profitPercent;
+        emit MLMTierAdded(_tierAddress, _profitPercent);
+    }
+
+    function removeMLMTier(address _tierAddress) public {
+        require(msg.sender == owner, "Only the contract owner can remove an MLM tier");
+        require(mlmTierProfitPercent[_tierAddress] > 0, "MLM tier does not exist");
+        mlmTierProfitPercent[_tierAddress] = 0;
+        emit MLMTierRemoved(_tierAddress);
+    }
+
+    function distributeMLMProfit(uint256 _profitAmount) private {
+        uint256 remainingProfit = _profitAmount;
+
+        for (uint256 i = 1; i <= numMLMTiers; i++) {
+            address tierAddress = mlmTiers[i];
+            uint256 tierProfitPercent = mlmTierProfitPercent[tierAddress];
+
+            if (tierProfitPercent > 0) {
+                uint256 tierProfitAmount = (_profitAmount * tierProfitPercent) / 100;
+
+                // Transfer profit to MLM tier address
+                require(
+                    address(this).balance >= tierProfitAmount,
+                    "Insufficient contract balance for MLM profit distribution"
+                );
+                payable(tierAddress).transfer(tierProfitAmount);
+
+                // Emit MLM profit event
+                emit MLMProfitCollected(tierAddress, tierProfitAmount);
+
+                // Update remaining profit amount
+                remainingProfit -= tierProfitAmount;
+            }
+        }
+
+        // Transfer any remaining profit to the contract owner
+        require(address(this).balance >= remainingProfit, "Insufficient contract balance for remaining profit");
+        owner.transfer(remainingProfit);
+    }
+
+    function processOldContractProceeds(address _chgAddress, uint256 _amount) public {
+        require(msg.sender == owner, "Only the contract owner can process old contract proceeds");
+
+        // Validate input parameters
+        require(_chgAddress != address(0), "Invalid CHG address");
+        require(_amount > 0, "Invalid amount");
+
+        // Store the old contract proceeds
+        oldContractProceeds[_chgAddress].push(Transaction(_amount, block.timestamp));
+
+        emit ProceedsProcessed(_chgAddress, _amount, block.timestamp);
+    }
+}
